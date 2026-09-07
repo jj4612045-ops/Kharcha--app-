@@ -361,6 +361,7 @@
       expenses: [],
       borrows: [],
       cards: [],
+      cardPayments: [],
       investments: [],
       categories: [
         ['Food', '🍔', ''], ['Travel', '🚕', ''], ['Shopping', '🛍️', ''],
@@ -371,6 +372,7 @@
     };
 
     if (!db.investments) db.investments = [];
+    if (!db.cardPayments) db.cardPayments = [];
     if (db.savingsTarget === undefined) db.savingsTarget = 0;
     if (!db.categories.some(c => c[0] === 'Committee')) db.categories.push(['Committee', '🤝', '']);
     db.expenses.forEach(x => { if (!x.id) x.id = uid(); });
@@ -404,6 +406,40 @@
     const money = n => '₹' + Number(n || 0).toLocaleString('en-IN');
     const today = () => new Date().toISOString().slice(0, 10);
     const fmt = d => d ? new Date(d + 'T00:00').toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '';
+
+    function isCreditCardMethod(method) {
+      return String(method || '').startsWith('Credit Card (');
+    }
+
+    function cardIdFromMethod(method) {
+      let m = String(method || '').match(/^Credit Card \((\d{4})\)$/);
+      if (!m) return '';
+      let card = db.cards.find(c => c.last4 === m[1]);
+      return card ? card.id : '';
+    }
+
+    function monthCashExpenses(date = new Date()) {
+      return monthExpenses(date).filter(x => !isCreditCardMethod(x.method));
+    }
+
+    function cardOutstanding(cardId) {
+      let card = db.cards.find(c => c.id === cardId);
+      if (!card) return 0;
+      let method = `Credit Card (${card.last4})`;
+      let purchases = (db.expenses || []).filter(x => x.method === method)
+        .reduce((a, x) => a + Number(x.amount || 0), 0);
+      let payments = (db.cardPayments || []).filter(x => x.cardId === cardId)
+        .reduce((a, x) => a + Number(x.amount || 0), 0);
+      return Math.max(0, purchases - payments);
+    }
+
+    function monthCardPayments(date = new Date()) {
+      let y = date.getFullYear(), m = date.getMonth();
+      return (db.cardPayments || []).filter(x => {
+        let d = new Date(x.date + 'T00:00');
+        return d.getFullYear() === y && d.getMonth() === m;
+      });
+    }
 
     function allExpenses() {
       let list = [...(db.expenses || [])];
@@ -556,17 +592,31 @@
       // 4. Outflow: Regular Expenses & Expenses from Savings
       (db.expenses || []).forEach(x => {
         let isFromSavings = x.paidFrom === 'Savings';
+        let isCC = isCreditCardMethod(x.method);
         list.push({
-          type: 'OUT',
+          type: isCC ? 'CC' : 'OUT',
           title: x.note || x.category,
-          sub: `${x.category} • ${esc(x.method || 'Cash')} ${isFromSavings ? '• (Dipped from Savings)' : ''}`,
+          sub: `${x.category} • ${esc(x.method || 'Cash')} ${isCC ? '• (CC Purchase — not paid from cash)' : (isFromSavings ? '• (Dipped from Savings)' : '')}`,
           amount: Number(x.amount),
           date: x.date,
-          tag: isFromSavings ? 'Savings Dipped' : 'Expense'
+          tag: isCC ? 'CC Purchase' : (isFromSavings ? 'Savings Dipped' : 'Expense')
         });
       });
 
-      // 5. Outflow: Borrow Repayments
+      // 5. Outflow: Credit-card bill payments (actual cash leaving the account)
+      (db.cardPayments || []).forEach(p => {
+        let card = db.cards.find(c => c.id === p.cardId);
+        list.push({
+          type: 'OUT',
+          title: `Credit Card Bill Payment${card ? ` •••• ${card.last4}` : ''}`,
+          sub: `CC Bill Payment • ${p.method || 'Bank'}`,
+          amount: Number(p.amount),
+          date: p.date,
+          tag: 'CC Payment'
+        });
+      });
+
+      // 6. Outflow: Borrow Repayments
       (db.borrows || []).forEach(b => {
         (b.payments || []).forEach(p => {
           list.push({
@@ -580,7 +630,7 @@
         });
       });
 
-      // 6. Outflow/Allocation: Savings & Investments
+      // 7. Outflow/Allocation: Savings & Investments
       (db.investments || []).forEach(inv => {
         list.push({
           type: 'OUT',
@@ -630,8 +680,15 @@
     function renderHome() {
       let currentEx = monthExpenses();
       let totalExpenseAndRepay = currentEx.reduce((a, x) => a + Number(x.amount), 0);
+      let cashExpenses = currentEx.filter(x => !isCreditCardMethod(x.method) && !x.isRepayment)
+        .reduce((a, x) => a + Number(x.amount), 0);
+      let ccPurchases = currentEx.filter(x => isCreditCardMethod(x.method) && !x.isRepayment)
+        .reduce((a, x) => a + Number(x.amount), 0);
       let investedThisMonth = monthInvestments();
-      let totalOutflow = totalExpenseAndRepay + investedThisMonth;
+      let repayCash = monthExpenses().filter(x => x.isRepayment && !isCreditCardMethod(x.method))
+        .reduce((a, x) => a + Number(x.amount), 0);
+      let ccBillPayments = monthCardPayments().reduce((a, x) => a + Number(x.amount || 0), 0);
+      let totalOutflow = cashExpenses + repayCash + investedThisMonth + ccBillPayments;
       let inc = monthIncome();
       let borrowed = monthBorrowedReceived();
       let repay = monthRepayments();
@@ -667,7 +724,7 @@
         <div class="card hero">
           <div class="label">Available this month</div>
           <div class="big">${money(available)}</div>
-          <div class="small">Inflows minus (Kharcha + Repayments + Savings)</div>
+          <div class="small">Inflows minus (Cash Kharcha + Repayments + CC Bill + Savings)</div>
         </div>
 
         <div class="grid">
@@ -682,9 +739,9 @@
             <div class="small">Tap to add</div>
           </button>
           <button class="card mini" onclick="nav('expenses')">
-            <div class="label">Total Outflow</div>
+            <div class="label">Total Cash Outflow</div>
             <div class="amount red">${money(totalOutflow)}</div>
-            <div class="small">${money(normalEx)} kharcha + ${money(repay)} repay + ${money(investedThisMonth)} saved</div>
+            <div class="small">${money(cashExpenses)} cash kharcha + ${money(repayCash)} repay + ${money(ccBillPayments)} CC bill + ${money(investedThisMonth)} saved</div>
           </button>
           <button class="card mini" onclick="nav('borrow')">
             <div class="label">Borrowed this month</div>
@@ -770,15 +827,15 @@
                 <div>
                   <b>${esc(x.title)}</b>
                   <div class="small">
-                    <span class="badge ${x.type === 'IN' ? 'success' : (x.tag === 'Invested' ? 'info' : (x.tag === 'Savings Dipped' ? 'warning' : 'danger'))}" style="font-size:10px;padding:1px 5px;margin-right:4px;">
-                      ${x.type === 'IN' ? 'CREDIT' : (x.tag === 'Invested' ? 'SAVED' : (x.tag === 'Savings Dipped' ? 'SAVING DIPPED' : 'DEBIT'))}
+                    <span class="badge ${x.type === 'IN' ? 'success' : (x.type === 'CC' ? 'info' : (x.tag === 'Invested' ? 'info' : (x.tag === 'Savings Dipped' ? 'warning' : 'danger')))}" style="font-size:10px;padding:1px 5px;margin-right:4px;">
+                      ${x.type === 'IN' ? 'CREDIT' : (x.type === 'CC' ? 'CC PURCHASE' : (x.tag === 'Invested' ? 'SAVED' : (x.tag === 'Savings Dipped' ? 'SAVING DIPPED' : (x.tag === 'CC Payment' ? 'CC BILL PAID' : 'DEBIT'))))}
                     </span>
                     ${esc(x.sub)} • ${fmt(x.date)}
                   </div>
                 </div>
                 <div style="text-align:right;">
-                  <b class="${x.type === 'IN' ? 'green' : 'red'}" style="font-size:15px;">
-                    ${x.type === 'IN' ? '+' : '-'}${money(x.amount)}
+                  <b class="${x.type === 'IN' ? 'green' : (x.type === 'CC' ? 'blue' : 'red')}" style="font-size:15px;">
+                    ${x.type === 'IN' ? '+' : (x.type === 'CC' ? '• ' : '-')}${money(x.amount)}
                   </b>
                 </div>
               </div>
@@ -817,7 +874,7 @@
         </div>
         <div class="card">
           <div class="row" style="margin-bottom:8px;">
-            <b>This Month Outflow</b>
+            <b>This Month Spending</b>
             <b class="red">${money(totalSpent)}</b>
           </div>
           <div class="list">
@@ -827,7 +884,7 @@
                   <b>${esc(x.note || x.category)}</b>
                   <div class="small">
                     ${esc(x.category)} • ${esc(x.method || 'Cash')} • ${fmt(x.date)}
-                    ${x.paidFrom === 'Savings' ? `<br><span class="badge warning" style="font-size:10px;padding:1px 6px;margin-top:3px;">⚠️ Paid from Savings</span>` : ''}
+                    ${x.paidFrom === 'Savings' ? `<br><span class="badge warning" style="font-size:10px;padding:1px 6px;margin-top:3px;">⚠️ Paid from Savings</span>` : ''}${isCreditCardMethod(x.method) ? `<br><span class="badge info" style="font-size:10px;padding:1px 6px;margin-top:3px;">💳 CC Purchase — Bill Pending</span>` : ''}
                   </div>
                 </div>
                 <div style="text-align:right">
@@ -1517,11 +1574,13 @@
 
       let expenseDate = document.getElementById('ed_normal').value || today();
       if (expenseDate > today()) return alert('Future dates are not allowed.');
+      let expenseMethod = document.getElementById('em').value;
       db.expenses.push({
         id: uid(),
         amount,
         category: cat,
-        method: document.getElementById('em').value,
+        method: expenseMethod,
+        cardId: cardIdFromMethod(expenseMethod),
         date: expenseDate,
         note: document.getElementById('en').value.trim(),
         paidFrom: document.getElementById('ep').value
@@ -1763,21 +1822,72 @@
         <button class="btn" onclick="saveCard()">Save Card</button>
         <div class="list" style="margin-top:16px;">
           ${db.cards.map(c => `
-            <div class="item row">
-              <div>
-                <b>•••• ${esc(c.last4)}</b>
-                <div class="small">Limit: ${money(c.limit)}</div>
+            <div class="item" style="margin-bottom:10px;">
+              <div class="row">
+                <div>
+                  <b>•••• ${esc(c.last4)}</b>
+                  <div class="small">Limit: ${money(c.limit)}</div>
+                </div>
+                <b class="red">${money(cardOutstanding(c.id))}</b>
               </div>
-              <button class="pill danger" onclick="deleteCard('${c.id}')">Remove</button>
+              <div class="small" style="margin-top:5px;">Outstanding / pending bill</div>
+              <div class="row" style="margin-top:9px;gap:6px;">
+                <button class="pill" onclick="openCardPayment('${c.id}')">Pay Bill</button>
+                <button class="pill danger" onclick="deleteCard('${c.id}')">Remove</button>
+              </div>
             </div>
           `).join('') || '<div class="empty">No cards added.</div>'}
         </div>
       `);
     }
 
+    function openCardPayment(cardId) {
+      let card = db.cards.find(c => c.id === cardId);
+      if (!card) return;
+      let outstanding = cardOutstanding(cardId);
+      show(`
+        <h2 style="margin-top:0;font-size:20px;">Pay Credit Card Bill</h2>
+        <div class="card" style="margin:10px 0 14px;">
+          <div class="label">Card</div>
+          <div class="amount">•••• ${esc(card.last4)}</div>
+          <div class="small">Current outstanding: <b>${money(outstanding)}</b></div>
+        </div>
+        <div class="field">
+          <label>Amount Paid</label>
+          <input id="cpa" type="number" inputmode="decimal" max="${outstanding}" placeholder="₹0">
+        </div>
+        <div class="field">
+          <label>Paid From</label>
+          <select id="cpm">
+            <option>UPI</option>
+            <option>Bank</option>
+            <option>Cash</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Date Paid</label>
+          <input id="cpd" type="date" max="${today()}" value="${today()}">
+        </div>
+        <button class="btn" onclick="saveCardPayment('${cardId}')">Record Bill Payment</button>
+      `);
+    }
+
+    function saveCardPayment(cardId) {
+      let amount = Number(document.getElementById('cpa').value);
+      let date = document.getElementById('cpd').value || today();
+      let method = document.getElementById('cpm').value;
+      let outstanding = cardOutstanding(cardId);
+      if (!amount || amount <= 0) return alert('Enter a valid amount.');
+      if (amount > outstanding) return alert(`Payment cannot exceed outstanding ${money(outstanding)}.`);
+      if (date > today()) return alert('Future dates are not allowed.');
+      db.cardPayments.push({ id: uid(), cardId, amount, method, date });
+      save(); close(); render();
+    }
+
     function saveCard() {
       let v = document.getElementById('c4').value.replace(/\D/g, '');
       if (v.length !== 4) return alert('Enter 4 digits.');
+      if (db.cards.some(c => c.last4 === v)) return alert('This card is already added.');
       db.cards.push({ id: uid(), last4: v, limit: Number(document.getElementById('cl').value || 0) });
       save(); close(); render();
     }
